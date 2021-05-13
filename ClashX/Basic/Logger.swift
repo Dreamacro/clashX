@@ -13,9 +13,13 @@ class Logger {
     var fileLogger: DDFileLogger = DDFileLogger()
 
     private init() {
-        if let tty = DDTTYLogger.sharedInstance {
-            DDLog.add(tty) // TTY = Xcode console
-        }
+        #if DEBUG
+            DDLog.add(DDOSLogger.sharedInstance)
+        #endif
+        //default time zone is "UTC"
+        let dataFormatter = DateFormatter()
+        dataFormatter.setLocalizedDateFormatFromTemplate("YYYY/MM/dd HH:mm:ss:SSS")
+        fileLogger.logFormatter = DDLogFileFormatterDefault.init(dateFormatter: dataFormatter)
         fileLogger.rollingFrequency = TimeInterval(60 * 60 * 24) // 24 hours
         fileLogger.logFileManager.maximumNumberOfLogFiles = 3
         DDLog.add(fileLogger)
@@ -37,9 +41,7 @@ class Logger {
     }
 
     static func log(_ msg: String, level: ClashLogLevel = .info) {
-        DispatchQueue.global().async {
-            shared.logToFile(msg: "[\(level.rawValue)] \(msg)", level: level)
-        }
+        shared.logToFile(msg: "[\(level.rawValue)] \(msg)", level: level)
     }
 
     func logFilePath() -> String {

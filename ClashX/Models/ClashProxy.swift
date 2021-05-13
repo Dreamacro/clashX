@@ -16,17 +16,29 @@ enum ClashProxyType: String, Codable {
     case direct = "Direct"
     case reject = "Reject"
     case shadowsocks = "Shadowsocks"
+    case shadowsocksR = "ShadowsocksR"
     case socks5 = "Socks5"
     case http = "Http"
     case vmess = "Vmess"
     case snell = "Snell"
+    case trojan = "Trojan"
+    case relay = "Relay"
     case unknown = "Unknown"
 
     static let proxyGroups: [ClashProxyType] = [.select, .urltest, .fallback, .loadBalance]
 
+    var isAutoGroup: Bool {
+        switch self {
+        case .urltest, .fallback, .loadBalance:
+            return true
+        default:
+            return false
+        }
+    }
+
     static func isProxyGroup(_ proxy: ClashProxy) -> Bool {
         switch proxy.type {
-        case .select, .urltest, .fallback, .loadBalance: return true
+        case .select, .urltest, .fallback, .loadBalance, .relay: return true
         default: return false
         }
     }
@@ -65,6 +77,8 @@ class ClashProxySpeedHistory: Codable {
     lazy var dateDisplay: String = {
         return hisDateFormaterInstance.shared.formater.string(from: time)
     }()
+
+    lazy var displayString: String = "\(dateDisplay) \(delayDisplay)"
 }
 
 class ClashProxy: Codable {
@@ -101,6 +115,10 @@ class ClashProxy: Codable {
         return proxys
     }()
 
+    lazy var isSpeedTestable: Bool = {
+        return speedtestAble.count > 0
+    }()
+
     private enum CodingKeys: String, CodingKey {
         case type, all, history, now, name
     }
@@ -127,10 +145,11 @@ class ClashProxy: Codable {
 }
 
 class ClashProxyResp {
-    let proxies: [ClashProxy]
+    var proxies: [ClashProxy]
+
     var proxiesMap: [ClashProxyName: ClashProxy]
 
-    private var enclosingProviderResp: ClashProviderResp?
+    var enclosingProviderResp: ClashProviderResp?
 
     init(_ data: Any?) {
         guard
@@ -172,6 +191,7 @@ class ClashProxyResp {
             for proxy in provider.proxies {
                 proxy.enclosingProvider = provider
                 proxiesMap[proxy.name] = proxy
+                proxies.append(proxy)
             }
         }
     }

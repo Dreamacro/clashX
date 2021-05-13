@@ -7,23 +7,27 @@ def get_version():
     with open('./go.mod') as file:
         for line in file.readlines():
             if "clash" in line and "ClashX" not in line:
-                return line.split(" ")[-1].strip()
+                return line.split("-")[-1].strip()[:6]
     return "unknown"
 
+def get_full_version():
+    with open('./go.mod') as file:
+        for line in file.readlines():
+            if "clash" in line and "ClashX" not in line:
+                return line.split(" ")[-1].strip()
 
 def build_clash(version):
     build_time = datetime.datetime.now().strftime("%Y-%m-%d-%H%M")
     command = f"""CGO_CFLAGS=-mmacosx-version-min=10.12 \
-CGO_LDFLAGS=-mmacosx-version-min=10.10 \
-GOBUILD=CGO_ENABLED=0 \
-go build -ldflags '-X "github.com/Dreamacro/clash/constant.Version={version}" \
+CGO_LDFLAGS=-mmacosx-version-min=10.12 \
+go build -trimpath -ldflags '-X "github.com/Dreamacro/clash/constant.Version={version}" \
 -X "github.com/Dreamacro/clash/constant.BuildTime={build_time}"' \
--buildmode=c-archive """
+-buildmode=c-archive -o goClash.a """
     subprocess.check_output(command, shell=True)
 
 
 def write_to_info(version):
-    path = "info.plist"
+    path = "../info.plist"
 
     with open(path, 'rb') as f:
         contents = plistlib.load(f)

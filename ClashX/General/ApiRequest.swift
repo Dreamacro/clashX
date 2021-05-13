@@ -23,6 +23,10 @@ class ApiRequest {
 
     private var proxyRespCache: ClashProxyResp?
 
+    private lazy var logQueue = DispatchQueue(label: "com.ClashX.core.log")
+
+    static let clashRequestQueue = DispatchQueue(label: "com.clashx.clashRequestQueue")
+
     private init() {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 604800
@@ -33,7 +37,7 @@ class ApiRequest {
     }
 
     private static func authHeader() -> HTTPHeaders {
-        let secret = ConfigManager.shared.apiSecret
+        let secret = ConfigManager.shared.overrideSecret ?? ConfigManager.shared.apiSecret
         return (secret.count > 0) ? ["Authorization": "Bearer \(secret)"] : [:]
     }
 
@@ -62,13 +66,22 @@ class ApiRequest {
     private var trafficWebSocket: WebSocket?
     private var loggingWebSocket: WebSocket?
 
-    private var trafficWebSocketRetryCount = 0
-    private var loggingWebSocketRetryCount = 0
+    private var trafficWebSocketRetryDelay: TimeInterval = 1
+    private var loggingWebSocketRetryDelay: TimeInterval = 1
+    private var trafficWebSocketRetryTimer: Timer?
+    private var loggingWebSocketRetryTimer: Timer?
 
     private var alamoFireManager: Session
 
+    static func useDirectApi() -> Bool {
+        if ConfigManager.shared.overrideApiURL != nil {
+            return false
+        }
+        return ConfigManager.builtInApiMode
+    }
+
     static func requestConfig(completeHandler: @escaping ((ClashConfig) -> Void)) {
-        if !ConfigManager.builtInApiMode {
+        if !useDirectApi() {
             req("/configs").responseDecodable(of: ClashConfig.self) {
                 resp in
                 switch resp.result {
@@ -92,18 +105,34 @@ class ApiRequest {
     }
 
     static func requestConfigUpdate(configName: String, callback: @escaping ((ErrorString?) -> Void)) {
-        let filePath = "\(kConfigFolderPath)\(configName).yaml"
+        if iCloudManager.shared.isICloudEnable() {
+            iCloudManager.shared.getUrl { url in
+                guard let url = url else {
+                    callback("icloud error")
+                    return
+                }
+                let configPath = url.appendingPathComponent(Paths.configFileName(for: configName)).path
+                requestConfigUpdate(configPath: configPath, callback: callback)
+            }
+        } else {
+            let filePath = Paths.localConfigPath(for: configName)
+            requestConfigUpdate(configPath: filePath, callback: callback)
+        }
+    }
+
+    static func requestConfigUpdate(configPath: String, callback: @escaping ((ErrorString?) -> Void)) {
         let placeHolderErrorDesp = "Error occoured, Please try to fix it by restarting ClashX. "
 
         // DEV MODE: Use API
-        if !ConfigManager.builtInApiMode {
-            req("/configs", method: .put, parameters: ["Path": filePath], encoding: JSONEncoding.default).responseJSON { res in
+        if !useDirectApi() {
+            req("/configs", method: .put, parameters: ["Path": configPath], encoding: JSONEncoding.default).responseJSON { res in
                 if res.response?.statusCode == 204 {
                     ConfigManager.shared.isRunning = true
                     callback(nil)
                 } else {
                     let errorJson = try? res.result.get()
                     let err = JSON(errorJson ?? "")["message"].string ?? placeHolderErrorDesp
+                    Logger.log(err)
                     callback(err)
                 }
             }
@@ -111,11 +140,16 @@ class ApiRequest {
         }
 
         // NORMAL MODE: Use internal api
-        let res = clashUpdateConfig(filePath.goStringBuffer())?.toString() ?? placeHolderErrorDesp
-        if res == "success" {
-            callback(nil)
-        } else {
-            callback(res)
+        clashRequestQueue.async {
+            let res = clashUpdateConfig(configPath.goStringBuffer())?.toString() ?? placeHolderErrorDesp
+            DispatchQueue.main.async {
+                if res == "success" {
+                    callback(nil)
+                } else {
+                    Logger.log(res)
+                    callback(res)
+                }
+            }
         }
     }
 
@@ -166,6 +200,7 @@ class ApiRequest {
     }
 
     static func updateAllowLan(allow: Bool, completeHandler: (() -> Void)? = nil) {
+        Logger.log("update allow lan:\(allow)", level: .debug)
         req("/configs",
             method: .patch,
             parameters: ["allow-lan": allow],
@@ -176,8 +211,7 @@ class ApiRequest {
     }
 
     static func updateProxyGroup(group: String, selectProxy: String, callback: @escaping ((Bool) -> Void)) {
-        let groupEncoded = group.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ""
-        req("/proxies/\(groupEncoded)",
+        req("/proxies/\(group.encoded)",
             method: .put,
             parameters: ["name": selectProxy],
             encoding: JSONEncoding.default)
@@ -189,10 +223,39 @@ class ApiRequest {
     static func getAllProxyList(callback: @escaping (([ClashProxyName]) -> Void)) {
         requestProxyGroupList {
             proxyInfo in
-            let lists: [ClashProxyName] = proxyInfo.proxies
-                .filter { $0.name == "GLOBAL" }
-                .first?.all ?? []
+            let lists: [ClashProxyName] = proxyInfo.proxiesMap["GLOBAL"]?.all ?? []
             callback(lists)
+        }
+    }
+
+    static func getMergedProxyData(complete: ((ClashProxyResp?) -> Void)? = nil) {
+        let group = DispatchGroup()
+        group.enter()
+        group.enter()
+
+        var provider: ClashProviderResp?
+        var proxyInfo: ClashProxyResp?
+
+        group.notify(queue: .main) {
+            guard let proxyInfo = proxyInfo, let proxyprovider = provider else {
+                assertionFailure()
+                complete?(nil)
+                return
+            }
+            proxyInfo.updateProvider(proxyprovider)
+            complete?(proxyInfo)
+        }
+
+        ApiRequest.requestProxyProviderList {
+            proxyprovider in
+            provider = proxyprovider
+            group.leave()
+        }
+
+        ApiRequest.requestProxyGroupList {
+            proxy in
+            proxyInfo = proxy
+            group.leave()
         }
     }
 
@@ -219,7 +282,7 @@ class ApiRequest {
         }
     }
 
-    static func healthCheck(proxy: ClashProviderName) {
+    static func healthCheck(proxy: ClashProviderName, completeHandler: (() -> Void)? = nil) {
         Logger.log("HeathCheck for \(proxy) started")
         req("/providers/proxies/\(proxy.encoded)/healthcheck").response { res in
             if res.response?.statusCode == 204 {
@@ -227,6 +290,7 @@ class ApiRequest {
             } else {
                 Logger.log("HeathCheck for \(proxy) failed")
             }
+            completeHandler?()
         }
     }
 }
@@ -259,19 +323,28 @@ extension ApiRequest {
 
 extension ApiRequest {
     func resetStreamApis() {
-        trafficWebSocketRetryCount = 0
-        loggingWebSocketRetryCount = 0
-        requestTrafficInfo()
+        resetLogStreamApi()
+        resetTrafficStreamApi()
+    }
+
+    func resetLogStreamApi() {
+        loggingWebSocketRetryTimer?.invalidate()
+        loggingWebSocketRetryTimer = nil
+        loggingWebSocketRetryDelay = 1
         requestLog()
     }
 
+    func resetTrafficStreamApi() {
+        trafficWebSocketRetryTimer?.invalidate()
+        trafficWebSocketRetryTimer = nil
+        trafficWebSocketRetryDelay = 1
+        requestTrafficInfo()
+    }
+
     private func requestTrafficInfo() {
+        trafficWebSocketRetryTimer?.invalidate()
+        trafficWebSocketRetryTimer = nil
         trafficWebSocket?.disconnect(forceTimeout: 0, closeCode: 0)
-        trafficWebSocketRetryCount += 1
-        if trafficWebSocketRetryCount > 5 {
-            NSUserNotificationCenter.default.postStreamApiConnectFail(api: "Traffic")
-            return
-        }
 
         let socket = WebSocket(url: URL(string: ConfigManager.apiUrl.appending("/traffic"))!)
 
@@ -284,20 +357,17 @@ extension ApiRequest {
     }
 
     private func requestLog() {
+        loggingWebSocketRetryTimer?.invalidate()
+        loggingWebSocketRetryTimer = nil
         loggingWebSocket?.disconnect()
-        loggingWebSocketRetryCount += 1
-        if loggingWebSocketRetryCount > 5 {
-            NSUserNotificationCenter.default.postStreamApiConnectFail(api: "Log")
-            return
-        }
 
         let uriString = "/logs?level=".appending(ConfigManager.selectLoggingApiLevel.rawValue)
         let socket = WebSocket(url: URL(string: ConfigManager.apiUrl.appending(uriString))!)
-
         for header in ApiRequest.authHeader() {
             socket.request.setValue(header.value, forHTTPHeaderField: header.name)
         }
         socket.delegate = self
+        socket.callbackQueue = logQueue
         socket.connect()
         loggingWebSocket = socket
     }
@@ -307,8 +377,10 @@ extension ApiRequest: WebSocketDelegate {
     func websocketDidConnect(socket: WebSocketClient) {
         guard let webSocket = socket as? WebSocket else { return }
         if webSocket == trafficWebSocket {
+            trafficWebSocketRetryDelay = 1
             Logger.log("trafficWebSocket did Connect", level: .debug)
         } else {
+            loggingWebSocketRetryDelay = 1
             Logger.log("loggingWebSocket did Connect", level: .debug)
         }
     }
@@ -319,15 +391,28 @@ extension ApiRequest: WebSocketDelegate {
         }
 
         Logger.log(err.localizedDescription, level: .error)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
-            guard let webSocket = socket as? WebSocket else { return }
-            if webSocket == self.trafficWebSocket {
-                Logger.log("trafficWebSocket did disconnect", level: .debug)
-                self.requestTrafficInfo()
-            } else {
-                Logger.log("loggingWebSocket did disconnect", level: .debug)
-                self.requestLog()
-            }
+
+        guard let webSocket = socket as? WebSocket else { return }
+
+        if webSocket == trafficWebSocket {
+            Logger.log("trafficWebSocket did disconnect", level: .debug)
+            trafficWebSocketRetryTimer?.invalidate()
+            trafficWebSocketRetryTimer =
+                Timer.scheduledTimer(withTimeInterval: trafficWebSocketRetryDelay, repeats: false, block: {
+                    [weak self] _ in
+                    if self?.trafficWebSocket?.isConnected == true { return }
+                    self?.requestTrafficInfo()
+                })
+            trafficWebSocketRetryDelay *= 2
+        } else {
+            Logger.log("loggingWebSocket did disconnect", level: .debug)
+            loggingWebSocketRetryTimer =
+                Timer.scheduledTimer(withTimeInterval: loggingWebSocketRetryDelay, repeats: false, block: {
+                    [weak self] _ in
+                    if self?.loggingWebSocket?.isConnected == true { return }
+                    self?.requestLog()
+                })
+            loggingWebSocketRetryDelay *= 2
         }
     }
 
